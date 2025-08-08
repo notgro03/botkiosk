@@ -1,17 +1,18 @@
 import express from "express";
 import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import { Twilio } from "twilio";
+import twilio from "twilio";           // 👈 import default (no { Twilio })
 import fetch from "node-fetch";
 
 dotenv.config();
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
 
-// Twilio client
-const client = new Twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// Cliente Twilio (con import default)
+const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Función para procesar con IA
+// ---- IA
 async function iaResponder(texto) {
   try {
     const r = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -23,25 +24,25 @@ async function iaResponder(texto) {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         messages: [
-          { role: "system", content: "Sos el asistente de KiosKeys. Respondé breve, clara y con tono cordial. Si es un pedido de llave o derivación, pedí ubicación y datos necesarios." },
+          { role: "system", content: "Sos el asistente de KiosKeys. Respondé breve y accionable. Acciones: INFO, DERIVAR, AGENDAR." },
           { role: "user", content: texto }
         ]
       })
     }).then(x => x.json());
 
     return r.choices?.[0]?.message?.content || "No te entendí, ¿me repetís?";
-  } catch (err) {
-    console.error("Error en IA:", err);
-    return "Hubo un problema al procesar tu mensaje.";
+  } catch (e) {
+    console.error("Error IA:", e);
+    return "Tuve un problema procesando tu mensaje.";
   }
 }
 
-// Webhook para mensajes entrantes de WhatsApp
+// ---- Webhook WhatsApp
 app.post("/whatsapp", async (req, res) => {
-  const from = req.body.From;   // Ej: "whatsapp:+54911..."
+  const from = req.body.From || "";
   const body = req.body.Body || "";
 
-  console.log("Mensaje recibido:", from, body);
+  console.log("Mensaje:", from, body);
 
   const reply = await iaResponder(body);
 
@@ -54,9 +55,8 @@ app.post("/whatsapp", async (req, res) => {
   res.sendStatus(200);
 });
 
-// Ruta básica de prueba
+// Healthcheck
 app.get("/", (_, res) => res.send("Bot KiosKeys funcionando 🚀"));
 
-app.listen(process.env.PORT || 3000, () => {
-  console.log("Bot escuchando en puerto", process.env.PORT || 3000);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Bot escuchando en puerto", PORT));
