@@ -14,7 +14,7 @@ app.use(express.json());
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Healthcheck
+// --- Healthcheck
 app.get("/", (_req, res) => res.send("Bot KiosKeys funcionando 🚀"));
 
 // --- Scraping demo usando fetch nativo (Node 18+)
