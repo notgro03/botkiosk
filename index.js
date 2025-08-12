@@ -9,15 +9,16 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false })); // Twilio envía x-www-form-urlencoded
 app.use(express.json());
 
+// Twilio client
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 // --- Healthcheck
 app.get("/", (_req, res) => res.send("Bot KiosKeys funcionando 🚀"));
 
-// --- Scraping demo usando fetch nativo (Node 18+)
+// --- Scraping demo (usa fetch nativo de Node 18+)
 async function scrapeProductos(query = "") {
   const resp = await fetch("https://kioskeys.com/");
   const html = await resp.text();
@@ -36,6 +37,7 @@ async function scrapeProductos(query = "") {
   return items.slice(0, 5);
 }
 
+// Ver productos desde el navegador, útil para probar rápido
 app.get("/productos", async (req, res) => {
   try {
     const q = String(req.query.q || "");
@@ -44,6 +46,18 @@ app.get("/productos", async (req, res) => {
   } catch (e) {
     console.error("Error /productos:", e);
     res.status(500).json({ error: "No se pudieron obtener los productos" });
+  }
+});
+
+// Ruta de debug (verifica que el server responde y el fetch funciona)
+app.get("/debug", async (_req, res) => {
+  try {
+    const r = await fetch("https://kioskeys.com/");
+    const htmlLen = (await r.text()).length;
+    res.send(`OK - fetched kioskeys.com (${htmlLen} chars)`);
+  } catch (e) {
+    console.error("DEBUG error:", e);
+    res.status(500).send("Fetch fallo");
   }
 });
 
@@ -71,10 +85,11 @@ app.post("/whatsapp", async (req, res) => {
     reply = "Genial. Decime *particular* o *seguro* y la *patente*. Luego te pido el resto.";
   } else if (/humano|asesor|persona/i.test(body)) {
     reply = "Te paso con un asesor ahora mismo. Aguantame un segundo 🙌";
+    // Aviso opcional a un número interno
     if (process.env.HUMAN_WHATSAPP_TO) {
       try {
         await client.messages.create({
-          from: process.env.TWILIO_WHATSAPP_FROM,
+          from: process.env.TWILIO_WHATSAPP_FROM,   // ej: whatsapp:+14155238886 (sandbox)
           to: `whatsapp:${process.env.HUMAN_WHATSAPP_TO.replace(/^whatsapp:/, "")}`,
           body: `⚠️ Handoff: el cliente ${from} pidió humano.`
         });
@@ -84,9 +99,10 @@ app.post("/whatsapp", async (req, res) => {
     }
   }
 
+  // enviar respuesta al usuario
   try {
     await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_FROM,
+      from: process.env.TWILIO_WHATSAPP_FROM, // "whatsapp:+14155238886" o tu número productivo
       to: from,
       body: reply
     });
