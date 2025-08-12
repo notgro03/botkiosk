@@ -1,219 +1,131 @@
-// index.js
 import express from "express";
 import dotenv from "dotenv";
 import twilio from "twilio";
 
 dotenv.config();
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.urlencoded({ extended: false })); // Twilio: x-www-form-urlencoded
+app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// Twilio client
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Memoria simple de sesiones (MVP)
-const sessions = new Map(); // key: whatsapp:+54911... -> { stage, flow, data:{} }
+const sessions = new Map();
 
-const saludo =
+const SALUDO =
   "¡Hola! Soy el asistente de *KiosKeys* 👋\n" +
-  "¿Qué necesitás hoy?\n\n" +
-  "1) Solicitud de duplicado\n" +
-  "2) Cambio de carcasa\n" +
-  "3) Llave nueva\n\n" +
-  "Respondé con *1, 2 o 3*. Escribí *0* o *menu* para volver al inicio.";
+  "Elegí una opción:\n\n" +
+  "1) *Solicitud de duplicado*\n" +
+  "2) *Cambio de carcasa*\n" +
+  "3) *Llave nueva*\n\n" +
+  "Respondé con *1, 2 o 3*. En cualquier momento escribí *0* o *menu* para volver al inicio.";
 
-// Healthcheck
 app.get("/", (_req, res) => res.send("Bot KiosKeys funcionando 🚀"));
 
-// -------- utilidades ----------
-function toTicket() {
-  return new Date().toISOString().replace(/\D/g, "").slice(2, 10) + "-" + Math.floor(Math.random() * 900 + 100);
-}
-function normPatente(txt = "") {
-  return txt.toUpperCase().replace(/[^A-Z0-9]/g, "");
-}
-function isYear(y) {
-  const n = Number(String(y).trim());
-  return n >= 1980 && n <= new Date().getFullYear() + 1;
-}
-async function alertHuman(summary) {
-  const to = process.env.HUMAN_WHATSAPP_TO;
-  const from = process.env.TWILIO_WHATSAPP_FROM;
-  if (!to || !from) return;
-  try {
+function newSession() { return { stage: "menu", flow: null, data: {} }; }
+function toMenu(s){ s.stage="menu"; s.flow=null; s.data={}; return SALUDO; }
+function pedirRol(s){ s.stage="dup_rol"; return "¿Es *1) Asegurado* o *2) Particular*? Respondé 1 o 2."; }
+function pedirMarca(s){ s.stage=`${s.flow}_marca`; return "Decime la *marca* del vehículo."; }
+function pedirModelo(s){ s.stage=`${s.flow}_modelo`; return "Perfecto. ¿Cuál es el *modelo*?"; }
+function pedirAnio(s){ s.stage=`${s.flow}_anio`; return "Gracias. Indicá el *año* (ej: 2018)."; }
+function pedirPatente(s){ s.stage=`${s.flow}_patente`; return "Por último, la *patente* (ej: ABC123 o AA123BB)."; }
+const isYear = y => { const n=+String(y).trim(); const Y=new Date().getFullYear(); return n>=1980 && n<=Y+1; };
+const normPat = p => String(p).toUpperCase().replace(/[^A-Z0-9]/g,"");
+const ticket = () => Date.now().toString().slice(-6);
+
+async function alertHuman(msg){
+  const to = process.env.HUMAN_WHATSAPP_TO, from = process.env.TWILIO_WHATSAPP_FROM;
+  if(!to || !from) return;
+  try{
     await client.messages.create({
       from,
-      to: `whatsapp:${to.replace(/^whatsapp:/, "")}`,
-      body: `🔔 *Handoff KiosKeys*\n${summary}`
+      to: `whatsapp:${to.replace(/^whatsapp:/,"")}`,
+      body: `🔔 *Handoff KiosKeys*\n${msg}`
     });
-  } catch (e) {
-    console.error("No pude avisar a humano:", e.message);
-  }
-}
-function menuReply(s) {
-  s.stage = "menu";
-  s.flow = null;
-  s.data = {};
-  return saludo;
-}
-function pedirRol(s) {
-  s.stage = "dup_rol";
-  return "¿El duplicado es por *1) Seguro* o *2) Particular*?\nRespondé *1* o *2*.";
-}
-function pedirMarca(s) {
-  s.stage = `${s.flow}_marca`;
-  return "Decime la *marca* del vehículo.";
-}
-function pedirModelo(s) {
-  s.stage = `${s.flow}_modelo`;
-  return "Perfecto. ¿Cuál es el *modelo*?";
-}
-function pedirAnio(s) {
-  s.stage = `${s.flow}_anio`;
-  return "Gracias. Indicá el *año* (ej: 2018).";
-}
-function pedirPatente(s) {
-  s.stage = `${s.flow}_patente`;
-  return "Por último, decime la *patente* (ej: ABC123 o AA123BB).";
-}
-function resumenCliente(from, s) {
-  const d = s.data || {};
-  const base =
-    `Cliente: ${from.replace("whatsapp:", "")}\n` +
-    `Ticket: ${toTicket()}\n` +
-    `Flujo: ${s.flow}\n` +
-    (d.role ? `Rol: ${d.role}\n` : "") +
-    `Marca/Modelo/Año: ${[d.marca, d.modelo, d.anio].filter(Boolean).join(" ") || "-"}\n` +
-    `Patente: ${d.patente || "-"}`;
-  return base;
-}
-function confirmacionUsuario(s) {
-  const d = s.data || {};
-  return (
-    "¡Gracias! Ya tomé tus datos:\n" +
-    `• Gestión: ${s.flow === "duplicado" ? "Solicitud de duplicado" : s.flow === "carcasa" ? "Cambio de carcasa" : "Llave nueva"}\n` +
-    (d.role ? `• Rol: ${d.role}\n` : "") +
-    `• Marca/Modelo/Año: ${[d.marca, d.modelo, d.anio].filter(Boolean).join(" ") || "-"}\n` +
-    `• Patente: ${d.patente || "-"}\n\n` +
-    "✅ Te paso con un asesor para finalizar. ¡Gracias por tu paciencia!"
-  );
+  }catch(e){ console.error("Aviso humano:", e.message); }
 }
 
-// -------- webhook WhatsApp ----------
-app.post("/whatsapp", async (req, res) => {
-  const from = req.body.From; // "whatsapp:+54911..."
-  const text = (req.body.Body || "").trim();
+app.post("/whatsapp", async (req,res)=>{
+  const from = req.body.From;
+  const text = (req.body.Body||"").trim();
 
-  let s = sessions.get(from);
-  if (!s) {
-    s = { stage: "menu", flow: null, data: {} };
-    sessions.set(from, s);
-  }
+  let s = sessions.get(from) || newSession();
+  sessions.set(from, s);
 
   let reply;
 
-  // Volver al menú
+  // Menú forzado
   if (/^(0|menu|menú)$/i.test(text)) {
-    reply = menuReply(s);
+    reply = toMenu(s);
   }
-  // Si estoy pidiendo algo puntual, proceso ese paso
-  else if (s.stage && s.stage !== "menu") {
-    const d = (s.data = s.data || {});
+  // Si estoy dentro de un paso
+  else if (s.stage !== "menu") {
+    const d = s.data;
     switch (s.stage) {
-      // --- Flujo duplicado
-      case "dup_rol": {
-        if (/^1/.test(text) || /seguro/i.test(text)) d.role = "ASEGURADO";
-        else if (/^2/.test(text) || /particular/i.test(text)) d.role = "PARTICULAR";
-        else return done("Por favor respondé *1 (Seguro)* o *2 (Particular)*.");
+      case "dup_rol":
+        if (/^1$/.test(text) || /asegurad/i.test(text)) d.role = "ASEGURADO";
+        else if (/^2$/.test(text) || /particular/i.test(text)) d.role = "PARTICULAR";
+        else { reply = "Por favor respondé *1 (Asegurado)* o *2 (Particular)*."; break; }
+        reply = pedirMarca(s); break;
 
-        reply = pedirMarca(s);
-        break;
-      }
       case "duplicado_marca":
       case "carcasa_marca":
-      case "llave_marca": {
-        d.marca = text;
-        reply = pedirModelo(s);
-        break;
-      }
+      case "llave_marca":
+        d.marca = text; reply = pedirModelo(s); break;
+
       case "duplicado_modelo":
       case "carcasa_modelo":
-      case "llave_modelo": {
-        d.modelo = text;
-        reply = pedirAnio(s);
-        break;
-      }
+      case "llave_modelo":
+        d.modelo = text; reply = pedirAnio(s); break;
+
       case "duplicado_anio":
       case "carcasa_anio":
-      case "llave_anio": {
-        if (!isYear(text)) return done("El *año* no parece válido. Ejemplo: *2018*. Probá de nuevo.");
-        d.anio = String(text).trim();
-        reply = pedirPatente(s);
-        break;
-      }
+      case "llave_anio":
+        if (!isYear(text)){ reply="El *año* no parece válido. Ej: *2018*."; break; }
+        d.anio = String(text).trim(); reply = pedirPatente(s); break;
+
       case "duplicado_patente":
       case "carcasa_patente":
-      case "llave_patente": {
-        d.patente = normPatente(text);
-
-        // Siempre derivamos a humano al completar datos
-        const summary = resumenCliente(from, s);
-        await alertHuman(summary);
-
-        reply = confirmacionUsuario(s);
-        // Reinicio a menú para una nueva gestión
-        reply += `\n\n${saludo}`;
-        s.stage = "menu";
-        s.flow = null;
-        s.data = {};
+      case "llave_patente":
+        d.patente = normPat(text);
+        const resumen =
+          `Ticket: ${ticket()}\n`+
+          `Gestión: ${s.flow}\n`+
+          (d.role?`Rol: ${d.role}\n`:"")+
+          `Marca/Modelo/Año: ${[d.marca,d.modelo,d.anio].filter(Boolean).join(" ")||"-"}\n`+
+          `Patente: ${d.patente||"-"}\n`+
+          `Cliente: ${from.replace("whatsapp:","")}`;
+        await alertHuman(resumen);
+        reply =
+          "¡Gracias! Ya tengo tus datos ✅\n"+
+          "Te paso con un asesor para finalizar la gestión.\n\n"+
+          SALUDO;
+        toMenu(s);
         break;
-      }
+
       default:
-        // Si el estado es raro, volanteamos a menú
-        reply = menuReply(s);
+        reply = toMenu(s);
     }
   }
-  // Si estoy en menú (o sin estado), interpreto opción
+  // Estoy en menú (o sin estado): interpreto opción
   else {
-    // Normalizo respuestas
-    if (/^1$/.test(text) || /duplicado/i.test(text)) {
-      s.flow = "duplicado";
-      reply = pedirRol(s);
-    } else if (/^2$/.test(text) || /carcasa/i.test(text)) {
-      s.flow = "carcasa";
-      reply = pedirMarca(s);
-    } else if (/^3$/.test(text) || /llave nueva|nueva llave/i.test(text)) {
-      s.flow = "llave";
-      reply = pedirMarca(s);
-    } else if (/^hola|buenas/i.test(text)) {
-      reply = menuReply(s);
-    } else {
-      // Cualquier otra cosa: mostramos menú
-      reply = menuReply(s);
-    }
+    if (/^1$/.test(text)) { s.flow="duplicado"; reply = pedirRol(s); }
+    else if (/^2$/.test(text)) { s.flow="carcasa"; reply = pedirMarca(s); }
+    else if (/^3$/.test(text)) { s.flow="llave";   reply = pedirMarca(s); }
+    else if (/^hola|buenas/i.test(text)) { reply = toMenu(s); }
+    else { reply = toMenu(s); }
   }
 
-  // Enviar WhatsApp (única respuesta)
-  try {
+  try{
     await client.messages.create({
       from: process.env.TWILIO_WHATSAPP_FROM,
       to: from,
       body: reply
     });
-  } catch (e) {
-    console.error("Error enviando WhatsApp:", e.message);
-  }
+  }catch(e){ console.error("Twilio send:", e.message); }
 
   res.sendStatus(200);
-
-  // util para responder inline en ciertos casos
-  function done(msg) {
-    reply = msg;
-    return;
-  }
 });
 
-app.listen(PORT, () => console.log("Servidor escuchando en", PORT));
+app.listen(PORT, ()=> console.log("UP on", PORT));
