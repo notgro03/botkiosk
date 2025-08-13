@@ -1,19 +1,46 @@
-// index.js — Bot KiosKeys (Twilio TwiML, formal, sin "OK", anti-eco)
+// index.js — Bot KiosKeys (Twilio TwiML + Google Sheets, formal, sin "OK")
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
+import { google } from "googleapis";
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Cliente solo para avisos internos (no se usa para responder al cliente)
+// Twilio (solo para avisos internos)
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Estado por sesión en memoria
+// ===== Google Sheets =====
+const SHEET_ID = process.env.GOOGLE_SHEET_ID;        // ID de la planilla
+const SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Solicitudes";
+
+const sheetsAuth = new google.auth.JWT(
+  process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+  null,
+  (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
+  ["https://www.googleapis.com/auth/spreadsheets"]
+);
+const sheets = google.sheets({ version: "v4", auth: sheetsAuth });
+
+async function logToSheet(row) {
+  if (!SHEET_ID) return;
+  try {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_TAB}!A1`,
+      valueInputOption: "USER_ENTERED",
+      requestBody: { values: [row] },
+    });
+  } catch (e) {
+    console.error("Sheets append error:", e.message);
+  }
+}
+
+// ===== Sesiones (memoria) =====
 const sessions = new Map(); // from -> { stage, flow, data, lastReply }
 
-// ----- Helpers de diálogo -----
+// ===== Helpers de diálogo =====
 function toMenu(s) {
   s.stage = "menu";
   s.flow = null;
@@ -34,14 +61,14 @@ function pedirRol(s) {
   return "¿El trámite es *1) Asegurado* o *2) Particular*? Respondé 1 o 2.";
 }
 
-// Aviso interno silencioso (no se lo mandamos al cliente)
+// Aviso interno (silencioso para el cliente)
 async function alertHumanSafe(clientFrom, summary) {
   const to = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
   const from = process.env.TWILIO_WHATSAPP_FROM;
   if (!to || !from) return;
 
   const normalizedClient = clientFrom.replace(/^whatsapp:/, "");
-  if (to === normalizedClient) return; // evita que el cliente vea el aviso
+  if (to === normalizedClient) return; // no avisar al mismo chat del cliente
 
   try {
     await client.messages.create({
@@ -54,7 +81,7 @@ async function alertHumanSafe(clientFrom, summary) {
   }
 }
 
-// -------- Webhook principal: devolvemos TwiML --------
+// ===== Webhook principal: respondemos con TwiML =====
 app.post("/whatsapp", async (req, res) => {
   const from = req.body.From;          // "whatsapp:+549..."
   const text = (req.body.Body || "").trim();
@@ -65,20 +92,20 @@ app.post("/whatsapp", async (req, res) => {
     sessions.set(from, s);
   }
 
-  let reply;
+  let reply; // lo que enviaremos en TwiML
 
-  // 1) Comandos globales
+  // ---- Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
     reply = toMenu(s);
   }
-  // 2) Comprensión breve fuera de flujo
+  // ---- Comprensión breve fuera de flujo
   else if (/precio|cu[aá]nto sale|costo|vale/i.test(text)) {
     reply = "💰 El precio depende del tipo de llave o servicio. Un asesor puede confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
     await alertHumanSafe(from, `Consulta de precios: “${text}” — Cliente: ${from.replace("whatsapp:","")}`);
   } else if (/ubicaci[oó]n|d[oó]nde est[aá]n|direcci[oó]n|horarios?/i.test(text)) {
     reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9:00–13:00 y 14:00–17:00 hs.";
   }
-  // 3) Flujos guiados
+  // ---- Flujos guiados (si no estoy en menú)
   else if (s.stage !== "menu") {
     const d = s.data;
     const Y = new Date().getFullYear();
@@ -135,6 +162,22 @@ app.post("/whatsapp", async (req, res) => {
       case "carcasa_patente":
       case "llave_patente": {
         d.patente = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+        // Guardamos en Sheets
+        const now = new Date().toLocaleString("es-AR");
+        const row = [
+          now,
+          from.replace("whatsapp:", ""),
+          s.flow,
+          d.role || "",
+          d.marca || "",
+          d.modelo || "",
+          d.anio || "",
+          d.patente || "",
+        ];
+        logToSheet(row);
+
+        // Aviso interno
         const resumen =
           `Solicitud: ${s.flow}\n` +
           (d.role ? `Rol: ${d.role}\n` : "") +
@@ -151,7 +194,7 @@ app.post("/whatsapp", async (req, res) => {
         reply = toMenu(s);
     }
   }
-  // 4) Menú principal
+  // ---- Menú principal
   else {
     if (/^1$/.test(text) || /duplicad/i.test(text)) {
       s.flow = "duplicado";
@@ -171,18 +214,17 @@ app.post("/whatsapp", async (req, res) => {
     }
   }
 
-  // ---------- ANTI-“OK” / ANTI-ECO ----------
+  // ==== ANTI “OK” / ANTI-ECO ====
   const safeReply = (reply || "").trim();
   const isOkOnly = /^ok\.?$/i.test(safeReply);
   const isDuplicate = safeReply && s.lastReply && safeReply === s.lastReply.trim();
 
-  // Construimos TwiML: si no hay nada que enviar, devolvemos 200 vacío (sin TwiML)
   if (!safeReply || isOkOnly || isDuplicate) {
-    s.lastReply = s.lastReply || ""; // mantenemos último
-    return res.status(200).end();     // NADA para el usuario => cero “OK”
+    // 200 sin TwiML => Twilio no agrega nada (y no mandamos "OK")
+    return res.status(200).end();
   }
 
-  // Respondemos con TwiML (así Twilio usa solo esta respuesta)
+  // Respondemos con TwiML para que Twilio use SOLO esta respuesta
   const twiml = new twilio.twiml.MessagingResponse();
   twiml.message(safeReply);
   s.lastReply = safeReply;
