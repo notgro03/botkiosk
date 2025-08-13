@@ -1,22 +1,24 @@
-// index.js — KiosKeys Bot (Twilio TwiML + OpenAI + Google Sheets)
+// index.js — KiosKeys Bot (Twilio TwiML + OpenAI extraction + Sheets)
+// Diseño: pocas idas y vueltas, pide todo en 1 mensaje, resume y confirma.
+
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
-import { google } from "googleapis";
 import OpenAI from "openai";
+import { google } from "googleapis";
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ====== Twilio (solo para avisos internos) ======
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// ===== Twilio (solo avisos internos) =====
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// ====== OpenAI (IA) ======
+// ===== OpenAI =====
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ====== Google Sheets (opcional pero recomendado) ======
-const SHEET_ID = process.env.GOOGLE_SHEET_ID;
+// ===== Google Sheets (opcional) =====
+const SHEET_ID  = process.env.GOOGLE_SHEET_ID || "";
 const SHEET_TAB = process.env.GOOGLE_SHEET_TAB || "Solicitudes";
 let sheets = null;
 
@@ -39,29 +41,36 @@ async function logToSheet(row) {
       spreadsheetId: SHEET_ID,
       range: `${SHEET_TAB}!A1`,
       valueInputOption: "USER_ENTERED",
-      requestBody: { values: [row] }
+      requestBody: { values: [row] },
     });
   } catch (e) {
     console.error("Sheets append error:", e.message);
   }
 }
 
-// ====== Sesiones (memoria) ======
-const sessions = new Map(); // from -> { stage, flow, data, lastReply, history: [{role, content}] }
+// ===== Sesiones (memoria) =====
+const sessions = new Map(); // from -> { stage, flow, data, lastReply }
 
-function pushHistory(s, role, content) {
-  s.history = s.history || [];
-  s.history.push({ role, content });
-  if (s.history.length > 24) s.history = s.history.slice(-24);
+// ===== Utilidades =====
+const Y = new Date().getFullYear();
+const isYear = v => /^\d{4}$/.test(v) && +v >= 1980 && +v <= Y + 1;
+const isCP   = v => /^\d{4}$/.test(v);
+const isPat  = v => /^(?:[A-Z]{3}\d{3}|[A-Z]{2}\d{3}[A-Z]{2})$/.test(v);
+
+function clean(text) {
+  return (text || "").normalize("NFKC").trim();
 }
 
-// ====== Helpers de diálogo ======
+function normalizePlate(p) {
+  return clean(p).toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
 function toMenu(s) {
   s.stage = "menu";
-  s.flow = null;
-  s.data = {};
-  return `¡Hola! Soy el asistente virtual de *KiosKeys* 👋
-Estoy aquí para ayudarte.
+  s.flow  = null;
+  s.data  = {};
+  return `¡Hola! Soy el asistente de *KiosKeys* 👋
+Estoy para ayudarte.
 
 Elegí una opción:
 1) *Solicitud de duplicado*
@@ -71,203 +80,224 @@ Elegí una opción:
 Respondé con *1, 2 o 3*. En cualquier momento escribí *0* o *menu* para volver aquí.`;
 }
 
-function pedirRol(s) {
-  s.stage = "dup_rol";
-  return "¿El trámite es *1) Asegurado* o *2) Particular*? Respondé 1 o 2.";
+function compactSummary(d) {
+  const line = (k, v) => (v ? `• ${k}: ${v}\n` : "");
+  return (
+    `📝 *Resumen del pedido*\n` +
+    line("Rol", d.role) +
+    line("Aseguradora", d.aseguradora) +
+    line("Marca", d.marca) +
+    line("Modelo", d.modelo) +
+    line("Año", d.anio) +
+    line("Patente", d.patente) +
+    line("CP", d.cp)
+  ).trim();
 }
 
+function requiredFields(flow, data) {
+  // Lo esencial para coordinar rápido con el cerrajero
+  const base = ["marca", "modelo", "anio", "patente"];
+  if (!data.role) base.unshift("role");
+  if (data.role === "ASEGURADO" && !data.aseguradora) base.unshift("aseguradora");
+  // CP ayuda a derivación (si lo tenés en siguiente etapa)
+  if (!data.cp) base.push("cp");
+  return [...new Set(base)];
+}
+
+// ===== Aviso interno silencioso =====
 async function alertHumanSafe(clientFrom, summary) {
-  const to = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
+  const to   = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
   const from = process.env.TWILIO_WHATSAPP_FROM;
   if (!to || !from) return;
-  const normalizedClient = clientFrom.replace(/^whatsapp:/, "");
+  const normalizedClient = (clientFrom || "").replace(/^whatsapp:/, "");
   if (to === normalizedClient) return;
   try {
-    await client.messages.create({
+    await twilioClient.messages.create({
       from,
       to: `whatsapp:${to}`,
-      body: `🔔 Aviso interno KiosKeys\n${summary}`
+      body: `🔔 Nuevo caso KiosKeys\n${summary}`,
     });
   } catch (e) {
-    console.error("Aviso interno falló:", e.message);
+    console.error("Handoff interno falló:", e.message);
   }
 }
 
-// ====== IA: respuesta libre cuando no encaja en menú/flujo ======
-async function aiReply(userText, session) {
+// ===== Extracción con IA (pensamiento propio) =====
+async function extractWithAI(userText, current) {
   try {
-    const messages = [
-      {
-        role: "system",
-        content:
-`Sos el asistente de *KiosKeys*. Respondé con tono formal, claro y breve.
-Si el usuario pide algo fuera del menú (duplicado/carcasa/llave nueva), orientalo y ofrecé derivación a un asesor humano.
-Nunca respondas solo "OK".
-Cuando sea de utilidad, recordá que estamos en Av. Hipólito Yrigoyen 114, Morón (9-13 y 14-17 hs).`
-      },
-      ...(session.history || []).slice(-10),
-      { role: "user", content: userText }
-    ];
+    const system =
+`Sos un extractor de datos para un bot de cerrajería (KiosKeys).
+Devolvés SIEMPRE JSON válido, sin texto extra.
+Campos posibles:
+- servicio: "duplicado" | "carcasa" | "llave_nueva" | "consulta" | "humano" | null
+- role: "ASEGURADO" | "PARTICULAR" | null
+- aseguradora: string|null
+- marca: string|null
+- modelo: string|null
+- anio: string|null (4 dígitos)
+- patente: string|null (formato ABC123 o AA123BB)
+- cp: string|null (4 dígitos)
+- intent_extra: "precio" | "ubicacion" | null
+
+Si el usuario menciona seguro/asegurado, role=ASEGURADO y extraé aseguradora si está.
+Podés inferir marca, modelo, año y patente del texto libre aunque vengan mezclados.
+No inventes datos. Dejá null si falta.
+`;
+
+    const user = `
+Texto del usuario: """${userText}"""
+Contexto actual: ${JSON.stringify(current || {})}
+Devolvé JSON:
+{"servicio":...,"role":...,"aseguradora":...,"marca":...,"modelo":...,"anio":...,"patente":...,"cp":...,"intent_extra":...}
+`;
 
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
       temperature: 0.2,
-      messages
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content: system },
+        { role: "user",   content: user   },
+      ],
     });
 
-    const text = resp.choices?.[0]?.message?.content?.trim();
-    return text || null;
+    const content = resp.choices?.[0]?.message?.content || "{}";
+    const data = JSON.parse(content);
+
+    // Normalizaciones mínimas
+    if (data.anio && !isYear(data.anio)) data.anio = null;
+    if (data.cp && !isCP(data.cp)) data.cp = null;
+    if (data.patente) {
+      data.patente = normalizePlate(data.patente);
+      if (!isPat(data.patente)) data.patente = null;
+    }
+
+    if (data.role) data.role = data.role.toUpperCase();
+    if (data.servicio) {
+      const map = { "duplicado":"duplicado", "carcasa":"carcasa", "llave_nueva":"llave", "llave":"llave" };
+      data.servicio = map[data.servicio] || data.servicio;
+    }
+
+    return data;
   } catch (e) {
-    console.error("OpenAI error:", e.message);
-    return null;
+    console.error("OpenAI extract error:", e.message);
+    return {};
   }
 }
 
-// ====== Webhook principal (Twiml) ======
+// ===== Webhook principal (Twiml) =====
 app.post("/whatsapp", async (req, res) => {
-  const from = req.body.From;                  // "whatsapp:+549..."
-  const text = (req.body.Body || "").trim();
+  const from = req.body.From;
+  const text = clean(req.body.Body);
 
   let s = sessions.get(from);
   if (!s) {
-    s = { stage: "menu", flow: null, data: {}, lastReply: "", history: [] };
+    s = { stage: "menu", flow: null, data: {}, lastReply: "" };
     sessions.set(from, s);
   }
-  pushHistory(s, "user", text);
 
   let reply;
 
-  // --- Comandos globales
+  // Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
     reply = toMenu(s);
-  }
-  // --- Atajos frecuentes
-  else if (/precio|cu[aá]nto sale|costo|vale/i.test(text)) {
-    reply = "💰 El precio depende del tipo de llave o servicio. Un asesor puede confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
-    await alertHumanSafe(from, `Consulta de precios: “${text}” — Cliente: ${from.replace("whatsapp:","")}`);
+  } else if (/humano|asesor|persona/i.test(text)) {
+    reply = "Un asesor te contactará por este chat a la brevedad 🙌";
+    await alertHumanSafe(from, `Pedido de humano — Cliente: ${from.replace("whatsapp:","")}`);
+  } else if (/precio|cu[aá]nto sale|costo|vale/i.test(text)) {
+    reply = "💰 El precio depende del tipo de llave/servicio. ¿Querés que un asesor confirme el valor exacto?";
+    await alertHumanSafe(from, `Consulta de precios: “${text}” — ${from.replace("whatsapp:","")}`);
   } else if (/ubicaci[oó]n|d[oó]nde est[aá]n|direcci[oó]n|horarios?/i.test(text)) {
-    reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9:00–13:00 y 14:00–17:00 hs.";
+    reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9–13 y 14–17 hs.";
   }
-  // --- Flujos guiados (si no estoy en menú)
-  else if (s.stage !== "menu") {
-    const d = s.data;
-    const Y = new Date().getFullYear();
-
-    switch (s.stage) {
-      case "dup_rol": {
-        if (/^1$/.test(text) || /asegurad/i.test(text)) {
-          d.role = "ASEGURADO";
-          s.stage = "duplicado_marca";
-          reply = "Perfecto. Indicame la *marca* del vehículo.";
-        } else if (/^2$/.test(text) || /particular/i.test(text)) {
-          d.role = "PARTICULAR";
-          s.stage = "duplicado_marca";
-          reply = "Entendido. Indicame la *marca* del vehículo.";
-        } else {
-          reply = "Por favor, respondé con *1 (Asegurado)* o *2 (Particular)*.";
-        }
-        break;
-      }
-
-      case "duplicado_marca":
-      case "carcasa_marca":
-      case "llave_marca": {
-        d.marca = text;
-        s.stage = `${s.flow}_modelo`;
-        reply = "Gracias. ¿Cuál es el *modelo*?";
-        break;
-      }
-
-      case "duplicado_modelo":
-      case "carcasa_modelo":
-      case "llave_modelo": {
-        d.modelo = text;
-        s.stage = `${s.flow}_anio`;
-        reply = "Perfecto. ¿En qué *año* fue fabricado? (ej: 2019)";
-        break;
-      }
-
-      case "duplicado_anio":
-      case "carcasa_anio":
-      case "llave_anio": {
-        const n = Number(text);
-        if (!Number.isFinite(n) || n < 1980 || n > Y + 1) {
-          reply = "El año no parece válido. Por ejemplo: *2019*.";
-        } else {
-          d.anio = String(n);
-          s.stage = `${s.flow}_patente`;
-          reply = "Por último, indicame la *patente* (ej: ABC123 o AA123BB).";
-        }
-        break;
-      }
-
-      case "duplicado_patente":
-      case "carcasa_patente":
-      case "llave_patente": {
-        d.patente = text.toUpperCase().replace(/[^A-Z0-9]/g, "");
-
-        // Log a Sheets
-        const now = new Date().toLocaleString("es-AR");
-        await logToSheet([
-          now,
-          from.replace("whatsapp:", ""),
-          s.flow,
-          d.role || "",
-          d.marca || "",
-          d.modelo || "",
-          d.anio || "",
-          d.patente || ""
-        ]);
-
-        // Handoff interno
-        const resumen =
-          `Solicitud: ${s.flow}\n` +
-          (d.role ? `Rol: ${d.role}\n` : "") +
-          `Marca: ${d.marca}\nModelo: ${d.modelo}\nAño: ${d.anio}\nPatente: ${d.patente}\n` +
-          `Cliente: ${from.replace("whatsapp:","")}`;
-        await alertHumanSafe(from, resumen);
-
-        reply = "✅ Gracias. Registré tu solicitud. En breve, un asesor se comunicará por este mismo chat para continuar.";
-        reply += `\n\n${toMenu(s)}`;
-        break;
-      }
-
-      default:
-        reply = toMenu(s);
-    }
-  }
-  // --- Menú principal
   else {
-    if (/^1$/.test(text) || /duplicad/i.test(text)) {
-      s.flow = "duplicado";
-      reply = pedirRol(s);
-    } else if (/^2$/.test(text) || /carcasa/i.test(text)) {
-      s.flow = "carcasa";
-      s.stage = "carcasa_marca";
-      reply = "Perfecto. Indicame la *marca* del vehículo.";
-    } else if (/^3$/.test(text) || /llave nueva/i.test(text)) {
-      s.flow = "llave";
-      s.stage = "llave_marca";
-      reply = "Perfecto. Indicame la *marca* del vehículo.";
-    } else if (/hola|buenas/i.test(text)) {
-      reply = toMenu(s);
-    } else {
-      // IA como fallback educado
-      const ai = await aiReply(text, s);
-      reply = ai || toMenu(s);
+    // IA: intentar entender qué quiere y extraer datos
+    const ai = await extractWithAI(text, s);
+
+    // setear servicio/flow si viene de IA
+    if (!s.flow && ai.servicio) {
+      if (ai.servicio === "duplicado") s.flow = "duplicado";
+      else if (ai.servicio === "carcasa") s.flow = "carcasa";
+      else if (ai.servicio === "llave" || ai.servicio === "llave_nueva") s.flow = "llave";
+      s.stage = "collect";
+    }
+
+    // merge de datos extraídos
+    s.data = { ...s.data, ...Object.fromEntries(
+      Object.entries(ai).filter(([k]) => ["role","aseguradora","marca","modelo","anio","patente","cp"].includes(k))
+    )};
+
+    // si no hay flow aún, usar menú
+    if (!s.flow) {
+      // también aceptar 1/2/3
+      if (/^1$/.test(text)) { s.flow="duplicado"; s.stage="collect"; }
+      else if (/^2$/.test(text)) { s.flow="carcasa";  s.stage="collect"; }
+      else if (/^3$/.test(text)) { s.flow="llave";    s.stage="collect"; }
+      else {
+        reply = toMenu(s);
+      }
+    }
+
+    // Recolección compacta y confirmación
+    if (!reply && s.flow) {
+      const need = requiredFields(s.flow, s.data).filter(f => !s.data[f]);
+      if (need.length > 0) {
+        // pedir TODO lo faltante en 1 mensaje
+        const pretty = need.map(f=>{
+          if (f==="role") return "rol (Asegurado/Particular)";
+          if (f==="anio") return "año (4 dígitos)";
+          if (f==="cp")   return "código postal (4 dígitos)";
+          return f;
+        }).join(", ");
+
+        // ejemplo compacto
+        let ejemplo = "La Caja, Ford Fiesta 2018, AB123CD, CP 1708";
+        if (!need.includes("aseguradora")) ejemplo = "Ford Fiesta 2018, AB123CD, CP 1708";
+        if (s.data.role === "PARTICULAR") ejemplo = "VW Gol 2017, AC123BD, CP 1407";
+
+        reply =
+`Perfecto. Para avanzar necesito: *${pretty}*.
+Escribilo en *un solo mensaje* (ej: “${ejemplo}”).`;
+        s.stage = "collect";
+      } else {
+        // Tenemos todo → pedir confirmación en bloque corto
+        const summary = compactSummary(s.data);
+        reply = `${summary}\n\n¿Confirmás? *1 Sí* / *2 Corregir*`;
+        s.stage = "confirm";
+      }
+    }
+
+    // Confirmación
+    if (s.stage === "confirm" && /^1$/.test(text)) {
+      // Log a Sheets
+      const d = s.data, now = new Date().toLocaleString("es-AR");
+      await logToSheet([
+        now, from.replace("whatsapp:",""), s.flow,
+        d.role || "", d.aseguradora || "", d.marca || "", d.modelo || "", d.anio || "",
+        d.patente || "", d.cp || ""
+      ]);
+
+      // Aviso interno
+      await alertHumanSafe(from, compactSummary(s.data) + `\nServicio: ${s.flow}\nCliente: ${from.replace("whatsapp:","")}`);
+
+      reply = "✅ Perfecto. Ya tomé el pedido. Un asesor te contactará por este chat en breve.";
+      // Volver a menú limpio
+      reply += `\n\n${toMenu(s)}`;
+    } else if (s.stage === "confirm" && /^2$/.test(text)) {
+      // Regresar a “collect” para corregir datos faltantes o erróneos
+      s.stage = "collect";
+      reply = "Sin problema. Indicame las correcciones en *un solo mensaje*.";
     }
   }
 
-  // ---- Anti-“OK”/anti-eco + TwiML ----
+  // -------- Anti “OK” / anti eco + TwiML --------
   const safeReply = (reply || "").trim();
   const isOkOnly = /^ok\.?$/i.test(safeReply);
   const isDuplicate = safeReply && s.lastReply && safeReply === s.lastReply.trim();
 
   if (!safeReply || isOkOnly || isDuplicate) {
-    return res.status(200).end(); // sin TwiML => Twilio no agrega nada
+    return res.status(200).end();
   }
-
-  pushHistory(s, "assistant", safeReply);
   s.lastReply = safeReply;
 
   const twiml = new twilio.twiml.MessagingResponse();
