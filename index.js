@@ -1,17 +1,16 @@
-// index.js — KiosKeys Bot (Twilio TwiML + OpenAI extraction + Sheets)
-// Diseño: pocas idas y vueltas, pide todo en 1 mensaje, resume y confirma.
-
+// index.js — KiosKeys Bot con IA + TwiML + Sheets + Derivación por CP (muestra solo dirección)
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
 import OpenAI from "openai";
 import { google } from "googleapis";
+import fs from "fs";
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// ===== Twilio (solo avisos internos) =====
+// ===== Twilio (solo avisos internos, NO se contacta al proveedor) =====
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 // ===== OpenAI =====
@@ -48,10 +47,55 @@ async function logToSheet(row) {
   }
 }
 
-// ===== Sesiones (memoria) =====
+// ===== Carga de cerrajerías (derivación) =====
+let LOCKSMITHS = [];
+try {
+  const path = process.env.LOCKSMITHS_PATH || "./locksmiths.json";
+  LOCKSMITHS = JSON.parse(fs.readFileSync(path, "utf8"));
+  console.log(`Locksmiths cargados: ${LOCKSMITHS.length}`);
+} catch (e) {
+  console.warn("No se pudo cargar locksmiths.json, derivación desactivada:", e.message);
+}
+
+// ---- Utilidades de derivación
+const pickPreferred = (list, servicio) =>
+  list
+    .filter(x => !servicio || !x.servicios || x.servicios.includes(servicio))
+    .sort((a,b) => (b.prioridad||0) - (a.prioridad||0))[0] || null;
+
+function deriveByCP(cp, servicio /* "duplicado" | "carcasa" | "llave" */) {
+  if (!cp || !/^\d{4}$/.test(cp) || !LOCKSMITHS.length) return null;
+
+  // 1) Exacto
+  const exact = LOCKSMITHS.filter(x => x.cp === cp);
+  let pick = pickPreferred(exact, servicio);
+  if (pick) return pick;
+
+  // 2) Prefijo (misma zona: dos primeros dígitos)
+  const pref2 = cp.slice(0,2);
+  const sameZone = LOCKSMITHS.filter(x => (x.cp || "").slice(0,2) === pref2);
+  pick = pickPreferred(sameZone, servicio);
+  if (pick) return pick;
+
+  // 3) Mínima distancia por CP (absoluta)
+  const nearest = [...LOCKSMITHS]
+    .filter(x => /^\d{4}$/.test(x.cp))
+    .map(x => ({ ...x, dist: Math.abs(Number(x.cp) - Number(cp)) }))
+    .sort((a,b) => a.dist - b.dist || (b.prioridad||0) - (a.prioridad||0));
+
+  pick = pickPreferred(nearest, servicio);
+  return pick;
+}
+
+function mapsLink(address) {
+  // Link de Google Maps simple
+  const q = encodeURIComponent(address);
+  return `https://maps.google.com/?q=${q}`;
+}
+
+// ===== Sesiones =====
 const sessions = new Map(); // from -> { stage, flow, data, lastReply }
 
-// ===== Utilidades =====
 const Y = new Date().getFullYear();
 const isYear = v => /^\d{4}$/.test(v) && +v >= 1980 && +v <= Y + 1;
 const isCP   = v => /^\d{4}$/.test(v);
@@ -60,7 +104,6 @@ const isPat  = v => /^(?:[A-Z]{3}\d{3}|[A-Z]{2}\d{3}[A-Z]{2})$/.test(v);
 function clean(text) {
   return (text || "").normalize("NFKC").trim();
 }
-
 function normalizePlate(p) {
   return clean(p).toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
@@ -95,16 +138,13 @@ function compactSummary(d) {
 }
 
 function requiredFields(flow, data) {
-  // Lo esencial para coordinar rápido con el cerrajero
   const base = ["marca", "modelo", "anio", "patente"];
   if (!data.role) base.unshift("role");
   if (data.role === "ASEGURADO" && !data.aseguradora) base.unshift("aseguradora");
-  // CP ayuda a derivación (si lo tenés en siguiente etapa)
   if (!data.cp) base.push("cp");
   return [...new Set(base)];
 }
 
-// ===== Aviso interno silencioso =====
 async function alertHumanSafe(clientFrom, summary) {
   const to   = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
   const from = process.env.TWILIO_WHATSAPP_FROM;
@@ -122,34 +162,29 @@ async function alertHumanSafe(clientFrom, summary) {
   }
 }
 
-// ===== Extracción con IA (pensamiento propio) =====
+// ===== IA: extracción de datos =====
 async function extractWithAI(userText, current) {
   try {
     const system =
 `Sos un extractor de datos para un bot de cerrajería (KiosKeys).
-Devolvés SIEMPRE JSON válido, sin texto extra.
-Campos posibles:
-- servicio: "duplicado" | "carcasa" | "llave_nueva" | "consulta" | "humano" | null
+Devolvés SIEMPRE JSON válido.
+Campos:
+- servicio: "duplicado" | "carcasa" | "llave" | "consulta" | "humano" | null
 - role: "ASEGURADO" | "PARTICULAR" | null
 - aseguradora: string|null
 - marca: string|null
 - modelo: string|null
 - anio: string|null (4 dígitos)
-- patente: string|null (formato ABC123 o AA123BB)
+- patente: string|null (ABC123/AA123BB)
 - cp: string|null (4 dígitos)
 - intent_extra: "precio" | "ubicacion" | null
-
-Si el usuario menciona seguro/asegurado, role=ASEGURADO y extraé aseguradora si está.
-Podés inferir marca, modelo, año y patente del texto libre aunque vengan mezclados.
-No inventes datos. Dejá null si falta.
-`;
+No inventes. Dejá null si no está.`;
 
     const user = `
-Texto del usuario: """${userText}"""
-Contexto actual: ${JSON.stringify(current || {})}
+Usuario: """${userText}"""
+Contexto: ${JSON.stringify(current || {})}
 Devolvé JSON:
-{"servicio":...,"role":...,"aseguradora":...,"marca":...,"modelo":...,"anio":...,"patente":...,"cp":...,"intent_extra":...}
-`;
+{"servicio":...,"role":...,"aseguradora":...,"marca":...,"modelo":...,"anio":...,"patente":...,"cp":...,"intent_extra":...}`;
 
     const resp = await openai.chat.completions.create({
       model: "gpt-4o-mini",
@@ -164,19 +199,15 @@ Devolvé JSON:
     const content = resp.choices?.[0]?.message?.content || "{}";
     const data = JSON.parse(content);
 
-    // Normalizaciones mínimas
     if (data.anio && !isYear(data.anio)) data.anio = null;
     if (data.cp && !isCP(data.cp)) data.cp = null;
     if (data.patente) {
       data.patente = normalizePlate(data.patente);
       if (!isPat(data.patente)) data.patente = null;
     }
-
     if (data.role) data.role = data.role.toUpperCase();
-    if (data.servicio) {
-      const map = { "duplicado":"duplicado", "carcasa":"carcasa", "llave_nueva":"llave", "llave":"llave" };
-      data.servicio = map[data.servicio] || data.servicio;
-    }
+    const mapS = { "llave_nueva": "llave" };
+    if (data.servicio) data.servicio = mapS[data.servicio] || data.servicio;
 
     return data;
   } catch (e) {
@@ -189,14 +220,10 @@ Devolvé JSON:
 app.post("/whatsapp", async (req, res) => {
   const from = req.body.From;
   const text = clean(req.body.Body);
+  let reply;
 
   let s = sessions.get(from);
-  if (!s) {
-    s = { stage: "menu", flow: null, data: {}, lastReply: "" };
-    sessions.set(from, s);
-  }
-
-  let reply;
+  if (!s) { s = { stage: "menu", flow: null, data: {}, lastReply: "" }; sessions.set(from, s); }
 
   // Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
@@ -209,50 +236,48 @@ app.post("/whatsapp", async (req, res) => {
     await alertHumanSafe(from, `Consulta de precios: “${text}” — ${from.replace("whatsapp:","")}`);
   } else if (/ubicaci[oó]n|d[oó]nde est[aá]n|direcci[oó]n|horarios?/i.test(text)) {
     reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9–13 y 14–17 hs.";
-  }
-  else {
-    // IA: intentar entender qué quiere y extraer datos
+  } else {
+    // IA: entendimiento + extracción
     const ai = await extractWithAI(text, s);
 
     // setear servicio/flow si viene de IA
-    if (!s.flow && ai.servicio) {
-      if (ai.servicio === "duplicado") s.flow = "duplicado";
-      else if (ai.servicio === "carcasa") s.flow = "carcasa";
-      else if (ai.servicio === "llave" || ai.servicio === "llave_nueva") s.flow = "llave";
+    if (!s.flow && ai.servicio && ["duplicado","carcasa","llave"].includes(ai.servicio)) {
+      s.flow = ai.servicio;
       s.stage = "collect";
     }
 
-    // merge de datos extraídos
-    s.data = { ...s.data, ...Object.fromEntries(
-      Object.entries(ai).filter(([k]) => ["role","aseguradora","marca","modelo","anio","patente","cp"].includes(k))
-    )};
+    // merge datos
+    s.data = {
+      ...s.data,
+      ...Object.fromEntries(
+        Object.entries(ai).filter(([k]) => ["role","aseguradora","marca","modelo","anio","patente","cp"].includes(k))
+      )
+    };
 
-    // si no hay flow aún, usar menú
+    // menú por números
     if (!s.flow) {
-      // también aceptar 1/2/3
       if (/^1$/.test(text)) { s.flow="duplicado"; s.stage="collect"; }
       else if (/^2$/.test(text)) { s.flow="carcasa";  s.stage="collect"; }
       else if (/^3$/.test(text)) { s.flow="llave";    s.stage="collect"; }
-      else {
-        reply = toMenu(s);
-      }
+      else reply = toMenu(s);
     }
 
-    // Recolección compacta y confirmación
     if (!reply && s.flow) {
-      const need = requiredFields(s.flow, s.data).filter(f => !s.data[f]);
-      if (need.length > 0) {
-        // pedir TODO lo faltante en 1 mensaje
-        const pretty = need.map(f=>{
+      const need = ["marca","modelo","anio","patente","cp"];
+      if (!s.data.role) need.unshift("role");
+      if (s.data.role === "ASEGURADO" && !s.data.aseguradora) need.unshift("aseguradora");
+
+      const faltan = need.filter(f => !s.data[f]);
+      if (faltan.length > 0) {
+        const pretty = faltan.map(f=>{
           if (f==="role") return "rol (Asegurado/Particular)";
           if (f==="anio") return "año (4 dígitos)";
           if (f==="cp")   return "código postal (4 dígitos)";
           return f;
         }).join(", ");
 
-        // ejemplo compacto
         let ejemplo = "La Caja, Ford Fiesta 2018, AB123CD, CP 1708";
-        if (!need.includes("aseguradora")) ejemplo = "Ford Fiesta 2018, AB123CD, CP 1708";
+        if (!faltan.includes("aseguradora")) ejemplo = "Ford Fiesta 2018, AB123CD, CP 1708";
         if (s.data.role === "PARTICULAR") ejemplo = "VW Gol 2017, AC123BD, CP 1407";
 
         reply =
@@ -260,44 +285,48 @@ app.post("/whatsapp", async (req, res) => {
 Escribilo en *un solo mensaje* (ej: “${ejemplo}”).`;
         s.stage = "collect";
       } else {
-        // Tenemos todo → pedir confirmación en bloque corto
+        // tenemos todo → derivación + confirmación (MUESTRA SOLO DIRECCIÓN)
+        const target = deriveByCP(s.data.cp, s.flow);
+        s.data._target = target || null;
+
         const summary = compactSummary(s.data);
-        reply = `${summary}\n\n¿Confirmás? *1 Sí* / *2 Corregir*`;
+        const destino = target
+          ? `\n📌 *Dirección sugerida según tu CP*: ${target.direccion}\nMapa: ${mapsLink(target.direccion)}`
+          : `\n📌 *Dirección sugerida*: la confirmamos por este chat.`;
+
+        reply = `${summary}${destino}\n\n¿Confirmás? *1 Sí* / *2 Corregir*`;
         s.stage = "confirm";
       }
     }
 
-    // Confirmación
     if (s.stage === "confirm" && /^1$/.test(text)) {
-      // Log a Sheets
       const d = s.data, now = new Date().toLocaleString("es-AR");
       await logToSheet([
         now, from.replace("whatsapp:",""), s.flow,
         d.role || "", d.aseguradora || "", d.marca || "", d.modelo || "", d.anio || "",
-        d.patente || "", d.cp || ""
+        d.patente || "", d.cp || "", d._target?.direccion || ""
       ]);
 
-      // Aviso interno
-      await alertHumanSafe(from, compactSummary(s.data) + `\nServicio: ${s.flow}\nCliente: ${from.replace("whatsapp:","")}`);
+      // Aviso interno SOLO al equipo (no al proveedor)
+      const baseSummary = compactSummary(d) + `\nServicio: ${s.flow}\nCliente: ${from.replace("whatsapp:","")}`;
+      await alertHumanSafe(from, baseSummary + (d._target ? `\nDirección sugerida: ${d._target.direccion}` : ""));
 
-      reply = "✅ Perfecto. Ya tomé el pedido. Un asesor te contactará por este chat en breve.";
-      // Volver a menú limpio
-      reply += `\n\n${toMenu(s)}`;
+      // Respuesta al cliente: SOLO DIRECCIÓN
+      reply = d._target
+        ? `✅ Listo. Registré tu solicitud.\nDirección más cercana según tu CP: *${d._target.direccion}*\nMapa: ${mapsLink(d._target.direccion)}\nUn asesor te confirmará la disponibilidad y horario por este chat.\n\n${toMenu(s)}`
+        : `✅ Listo. Registré tu solicitud. Un asesor te confirmará la dirección y horario por este chat.\n\n${toMenu(s)}`;
     } else if (s.stage === "confirm" && /^2$/.test(text)) {
-      // Regresar a “collect” para corregir datos faltantes o erróneos
       s.stage = "collect";
       reply = "Sin problema. Indicame las correcciones en *un solo mensaje*.";
     }
   }
 
-  // -------- Anti “OK” / anti eco + TwiML --------
+  // ---- Anti “OK” / anti-eco + TwiML ----
   const safeReply = (reply || "").trim();
-  const isOkOnly = /^ok\.?$/i.test(safeReply);
-  const isDuplicate = safeReply && s.lastReply && safeReply === s.lastReply.trim();
+  const isOkOnly  = /^ok\.?$/i.test(safeReply);
+  const isDup     = safeReply && s.lastReply && safeReply === s.lastReply.trim();
 
-  if (!safeReply || isOkOnly || isDuplicate) {
-    return res.status(200).end();
-  }
+  if (!safeReply || isOkOnly || isDup) return res.status(200).end();
   s.lastReply = safeReply;
 
   const twiml = new twilio.twiml.MessagingResponse();
@@ -307,6 +336,4 @@ Escribilo en *un solo mensaje* (ej: “${ejemplo}”).`;
 
 // Healthcheck
 app.get("/", (_req, res) => res.send("Bot KiosKeys funcionando 🚀"));
-app.listen(process.env.PORT || 3000, () => {
-  console.log("UP on", process.env.PORT || 3000);
-});
+app.listen(process.env.PORT || 3000, () => console.log("UP on", process.env.PORT || 3000));
