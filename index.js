@@ -1,3 +1,4 @@
+// index.js — Bot KiosKeys (formal, sin "OK", anti-eco)
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
@@ -8,10 +9,10 @@ app.use(bodyParser.json());
 
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// ====== Estado por sesión ======
-const sessions = new Map(); // key: From -> { stage, flow, data, lastReply }
+// ===== Estado de sesión en memoria =====
+const sessions = new Map(); // key: "whatsapp:+549..." -> {stage, flow, data, lastReply}
 
-// ====== Helpers de diálogo ======
+// ===== Helpers =====
 function toMenu(s) {
   s.stage = "menu";
   s.flow = null;
@@ -29,17 +30,17 @@ Respondé con *1, 2 o 3*. En cualquier momento escribí *0* o *menu* para volver
 
 function pedirRol(s) {
   s.stage = "dup_rol";
-  return "¿Es *1) Asegurado* o *2) Particular*? Respondé con 1 o 2.";
+  return "¿El trámite es *1) Asegurado* o *2) Particular*? Respondé 1 o 2.";
 }
 
-// ====== Aviso interno (silencioso para el cliente) ======
 async function alertHumanSafe(clientFrom, summary) {
   const to = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
   const from = process.env.TWILIO_WHATSAPP_FROM;
+  if (!to || !from) return;
 
-  if (!to || !from) return; // sin destino configurado
-  const normalizedClient = (clientFrom || "").replace(/^whatsapp:/, "");
-  if (to === normalizedClient) return; // no avises al mismo chat del cliente
+  // si el destino es el mismo número del cliente, no avisamos (para no “contaminar” el chat)
+  const normalizedClient = clientFrom.replace(/^whatsapp:/, "");
+  if (to === normalizedClient) return;
 
   try {
     await client.messages.create({
@@ -48,14 +49,15 @@ async function alertHumanSafe(clientFrom, summary) {
       body: `🔔 Aviso interno KiosKeys\n${summary}`,
     });
   } catch (e) {
-    console.error("No pude avisar a humano:", e.message);
+    console.error("Handoff interno falló:", e.message);
   }
 }
 
-// ====== Webhook principal ======
+// ===== Webhook principal =====
 app.post("/whatsapp", async (req, res) => {
-  const from = req.body.From;                  // "whatsapp:+54911..."
-  const text = (req.body.Body || "").trim();
+  const from = req.body.From;
+  const textRaw = (req.body.Body || "");
+  const text = textRaw.trim();
 
   let s = sessions.get(from);
   if (!s) {
@@ -63,25 +65,20 @@ app.post("/whatsapp", async (req, res) => {
     sessions.set(from, s);
   }
 
-  let reply; // lo que eventualmente enviaremos al cliente
+  let reply;
 
-  // ---- Comandos globales
+// ---- Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
     reply = toMenu(s);
   }
-  // ---- Comprensión básica fuera de flujo
+// ---- Comprensión corta (fuera de flujo)
   else if (/precio|cu[aá]nto sale|costo|vale/i.test(text)) {
-    reply =
-      "💰 Los precios dependen del tipo de llave o servicio. Un asesor podrá confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
-    await alertHumanSafe(
-      from,
-      `Consulta de precios: "${text}" — Cliente: ${from.replace("whatsapp:", "")}`
-    );
+    reply = "💰 El precio depende del tipo de llave/servicio. Un asesor puede confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
+    await alertHumanSafe(from, `Consulta de precios: “${text}” — Cliente: ${from.replace("whatsapp:","")}`);
   } else if (/ubicaci[oó]n|d[oó]nde est[aá]n|direcci[oó]n|horarios?/i.test(text)) {
-    reply =
-      "📍 Estamos en Av. Hipólito Yrigoyen 114, Morón. Horario de atención: 9:00–13:00 y 14:00–17:00 hs.";
+    reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9:00–13:00 y 14:00–17:00 hs.";
   }
-  // ---- Flujos guiados (si no estoy en menú)
+// ---- Flujos guiados (si no estoy en menú)
   else if (s.stage !== "menu") {
     const d = s.data;
     const Y = new Date().getFullYear();
@@ -142,14 +139,11 @@ app.post("/whatsapp", async (req, res) => {
           `Solicitud: ${s.flow}\n` +
           (d.role ? `Rol: ${d.role}\n` : "") +
           `Marca: ${d.marca}\nModelo: ${d.modelo}\nAño: ${d.anio}\nPatente: ${d.patente}\n` +
-          `Cliente: ${from.replace("whatsapp:", "")}`;
-
+          `Cliente: ${from.replace("whatsapp:","")}`;
         await alertHumanSafe(from, resumen);
 
-        reply =
-          "✅ Perfecto. Ya registré tu solicitud. En breve, un asesor se comunicará por este mismo chat para continuar.";
-        // volvemos a menú limpio
-        reply += `\n\n${toMenu(s)}`;
+        reply = "✅ Gracias. Registré tu solicitud. En breve, un asesor se comunicará por este mismo chat para continuar.";
+        reply += `\n\n${toMenu(s)}`; // resetea y muestra menú
         break;
       }
 
@@ -157,7 +151,7 @@ app.post("/whatsapp", async (req, res) => {
         reply = toMenu(s);
     }
   }
-  // ---- Estoy en menú: interpretar opción
+// ---- Menú: interpretar la opción
   else {
     if (/^1$/.test(text) || /duplicad/i.test(text)) {
       s.flow = "duplicado";
@@ -177,18 +171,13 @@ app.post("/whatsapp", async (req, res) => {
     }
   }
 
-  // ====== ANTI-“OK” / ANTI-ECO ======
-  // 1) no enviar si reply es vacío
-  // 2) no enviar si reply es "ok" (cualquier combinación)
-  // 3) no enviar si es igual a la última respuesta enviada
+// ---- Anti-“OK” & anti-eco ----
   const safeReply = (reply || "").trim();
   const isOkOnly = /^ok\.?$/i.test(safeReply);
   const isDuplicate = safeReply && s.lastReply && safeReply === s.lastReply.trim();
 
   if (safeReply && !isOkOnly && !isDuplicate) {
     try {
-      // log opcional para depurar
-      console.log("OUTBOUND >>", from, "||", safeReply.slice(0, 120));
       await client.messages.create({
         from: process.env.TWILIO_WHATSAPP_FROM,
         to: from,
@@ -200,11 +189,10 @@ app.post("/whatsapp", async (req, res) => {
     }
   }
 
-  // devolvemos 200 sin cuerpo (Twilio no necesita TwiML si usamos API saliente)
   res.sendStatus(200);
 });
 
-// ====== Healthcheck ======
+// Healthcheck
 app.get("/", (_req, res) => res.send("Bot KiosKeys funcionando 🚀"));
 app.listen(process.env.PORT || 3000, () =>
   console.log("UP on", process.env.PORT || 3000)
