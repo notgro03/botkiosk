@@ -1,4 +1,4 @@
-// index.js — Bot KiosKeys (formal, sin "OK", anti-eco)
+// index.js — Bot KiosKeys (Twilio TwiML, formal, sin "OK", anti-eco)
 import express from "express";
 import bodyParser from "body-parser";
 import twilio from "twilio";
@@ -7,12 +7,13 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
+// Cliente solo para avisos internos (no se usa para responder al cliente)
 const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// ===== Estado de sesión en memoria =====
-const sessions = new Map(); // key: "whatsapp:+549..." -> {stage, flow, data, lastReply}
+// Estado por sesión en memoria
+const sessions = new Map(); // from -> { stage, flow, data, lastReply }
 
-// ===== Helpers =====
+// ----- Helpers de diálogo -----
 function toMenu(s) {
   s.stage = "menu";
   s.flow = null;
@@ -33,14 +34,14 @@ function pedirRol(s) {
   return "¿El trámite es *1) Asegurado* o *2) Particular*? Respondé 1 o 2.";
 }
 
+// Aviso interno silencioso (no se lo mandamos al cliente)
 async function alertHumanSafe(clientFrom, summary) {
   const to = (process.env.HUMAN_WHATSAPP_TO || "").replace(/^whatsapp:/, "");
   const from = process.env.TWILIO_WHATSAPP_FROM;
   if (!to || !from) return;
 
-  // si el destino es el mismo número del cliente, no avisamos (para no “contaminar” el chat)
   const normalizedClient = clientFrom.replace(/^whatsapp:/, "");
-  if (to === normalizedClient) return;
+  if (to === normalizedClient) return; // evita que el cliente vea el aviso
 
   try {
     await client.messages.create({
@@ -49,15 +50,14 @@ async function alertHumanSafe(clientFrom, summary) {
       body: `🔔 Aviso interno KiosKeys\n${summary}`,
     });
   } catch (e) {
-    console.error("Handoff interno falló:", e.message);
+    console.error("Aviso interno falló:", e.message);
   }
 }
 
-// ===== Webhook principal =====
+// -------- Webhook principal: devolvemos TwiML --------
 app.post("/whatsapp", async (req, res) => {
-  const from = req.body.From;
-  const textRaw = (req.body.Body || "");
-  const text = textRaw.trim();
+  const from = req.body.From;          // "whatsapp:+549..."
+  const text = (req.body.Body || "").trim();
 
   let s = sessions.get(from);
   if (!s) {
@@ -67,18 +67,18 @@ app.post("/whatsapp", async (req, res) => {
 
   let reply;
 
-// ---- Comandos globales
+  // 1) Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
     reply = toMenu(s);
   }
-// ---- Comprensión corta (fuera de flujo)
+  // 2) Comprensión breve fuera de flujo
   else if (/precio|cu[aá]nto sale|costo|vale/i.test(text)) {
-    reply = "💰 El precio depende del tipo de llave/servicio. Un asesor puede confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
+    reply = "💰 El precio depende del tipo de llave o servicio. Un asesor puede confirmarte el valor exacto. ¿Querés que te contacte un asesor?";
     await alertHumanSafe(from, `Consulta de precios: “${text}” — Cliente: ${from.replace("whatsapp:","")}`);
   } else if (/ubicaci[oó]n|d[oó]nde est[aá]n|direcci[oó]n|horarios?/i.test(text)) {
     reply = "📍 Av. Hipólito Yrigoyen 114, Morón. Horario: 9:00–13:00 y 14:00–17:00 hs.";
   }
-// ---- Flujos guiados (si no estoy en menú)
+  // 3) Flujos guiados
   else if (s.stage !== "menu") {
     const d = s.data;
     const Y = new Date().getFullYear();
@@ -151,7 +151,7 @@ app.post("/whatsapp", async (req, res) => {
         reply = toMenu(s);
     }
   }
-// ---- Menú: interpretar la opción
+  // 4) Menú principal
   else {
     if (/^1$/.test(text) || /duplicad/i.test(text)) {
       s.flow = "duplicado";
@@ -171,25 +171,23 @@ app.post("/whatsapp", async (req, res) => {
     }
   }
 
-// ---- Anti-“OK” & anti-eco ----
+  // ---------- ANTI-“OK” / ANTI-ECO ----------
   const safeReply = (reply || "").trim();
   const isOkOnly = /^ok\.?$/i.test(safeReply);
   const isDuplicate = safeReply && s.lastReply && safeReply === s.lastReply.trim();
 
-  if (safeReply && !isOkOnly && !isDuplicate) {
-    try {
-      await client.messages.create({
-        from: process.env.TWILIO_WHATSAPP_FROM,
-        to: from,
-        body: safeReply,
-      });
-      s.lastReply = safeReply;
-    } catch (e) {
-      console.error("Twilio send error:", e.message);
-    }
+  // Construimos TwiML: si no hay nada que enviar, devolvemos 200 vacío (sin TwiML)
+  if (!safeReply || isOkOnly || isDuplicate) {
+    s.lastReply = s.lastReply || ""; // mantenemos último
+    return res.status(200).end();     // NADA para el usuario => cero “OK”
   }
 
-  res.sendStatus(200);
+  // Respondemos con TwiML (así Twilio usa solo esta respuesta)
+  const twiml = new twilio.twiml.MessagingResponse();
+  twiml.message(safeReply);
+  s.lastReply = safeReply;
+
+  res.type("text/xml").send(twiml.toString());
 });
 
 // Healthcheck
