@@ -1,30 +1,6 @@
 [
-  {
-    "nombre": "Prueba Morón",
-    "direccion": "Av. Rivadavia 1234, Morón, Buenos Aires",
-    "cp": "1708",
-    "prioridad": 10,
-    "servicios": ["duplicado", "carcasa", "llave"]
-  },
-  {
-    "nombre": "Prueba Haedo",
-    "direccion": "Av. Presidente Perón 200, Haedo, Buenos Aires",
-    "cp": "1706",
-    "prioridad": 8,
-    "servicios": ["duplicado", "carcasa"]
-  },
-  {
-    "nombre": "Prueba Ituzaingó",
-    "direccion": "Los Pozos 300, Ituzaingó, Buenos Aires",
-    "cp": "1714",
-    "prioridad": 7,
-    "servicios": ["duplicado", "llave"]
-  },
-  {
-    "nombre": "Prueba CABA",
-    "direccion": "Av. Santa Fe 1000, CABA",
-    "cp": "1425",
-    "prioridad": 6,
-    "servicios": ["duplicado", "carcasa", "llave"]
-  }
+  { "nombre": "Prueba Morón",   "direccion": "Av. Rivadavia 1234, Morón, Buenos Aires",    "cp": "1708", "prioridad": 10, "servicios": ["duplicado","carcasa","llave"] },
+  { "nombre": "Prueba Haedo",   "direccion": "Av. Presidente Perón 200, Haedo, Buenos Aires","cp": "1706", "prioridad": 8,  "servicios": ["duplicado","carcasa"] },
+  { "nombre": "Prueba Ituzaingó","direccion": "Los Pozos 300, Ituzaingó, Buenos Aires",     "cp": "1714", "prioridad": 7,  "servicios": ["duplicado","llave"] },
+  { "nombre": "Prueba CABA",    "direccion": "Av. Santa Fe 1000, CABA",                     "cp": "1425", "prioridad": 6,  "servicios": ["duplicado","carcasa","llave"] }
 ]
