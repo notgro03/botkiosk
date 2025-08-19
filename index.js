@@ -1,10 +1,21 @@
-// index.js — Flujo avanzado básico: menú + datos en 1 mensaje + derivación por CP + handoff sandbox
-// Requisitos: Twilio Sandbox + locksmiths.json en la raíz del repo.
+// index.js — Flujo avanzado con IA: menú + datos en 1 mensaje + derivación por CP + handoff sandbox
+// Requisitos: Twilio Sandbox + locksmiths.json en la raíz del repo + clave de OpenAI en las variables de entorno.
 
 import express from "express";
 import bodyParser from "body-parser";
 import fs from "fs";
 import twilio from "twilio";
+
+// ----- IA -----
+// La biblioteca `openai` se utiliza para procesar los mensajes de entrada mediante un modelo de lenguaje.
+// El agente IA extrae la intención del usuario (flow), si solicita hablar con un humano (human) y los
+// datos relevantes del pedido (role, aseguradora, marca, modelo, anio, patente, cp).  Si no hay
+// API key configurada en el entorno, el agente IA permanece inactivo y el bot utiliza la heurística
+// actual para interpretar el mensaje.
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const USE_AI = !!process.env.OPENAI_API_KEY;
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -105,7 +116,7 @@ Ejemplo: "${ej}"`;
 }
 
 function resumen(d, flow){
-  const L=(k,v)=>v?`• ${k}: ${v}\n`:"";
+  const L = (k, v) => v ? `• ${k}: ${v}\n` : "";
   return (
 `📝 *Resumen*
 • Servicio: ${flow}
@@ -113,7 +124,7 @@ ${L("Rol",d.role)}${L("Aseguradora",d.aseguradora)}${L("Marca",d.marca)}${L("Mod
   ).trim();
 }
 
-// parsing liviano
+// parsing liviano (heurística de expresiones regulares)
 function absorber(d, text){
   const t = text;
 
@@ -146,6 +157,58 @@ function absorber(d, text){
   }
 }
 
+// ---------- IA helpers ----------
+/**
+ * Realiza una petición al modelo de OpenAI para interpretar el texto del usuario.
+ * Devuelve un objeto con los campos:
+ * - flow: "duplicado", "carcasa", "llave" o "" si no se detecta
+ * - human: booleano indicando si quiere hablar con un asesor
+ * - role: "ASEGURADO" o "PARTICULAR" (opcional)
+ * - aseguradora, marca, modelo, anio, patente, cp: campos extraídos si están presentes
+ */
+async function interpretMessage(text) {
+  if (!USE_AI) return null;
+  const messages = [
+    {
+      role: "system",
+      content:
+        "Eres un asistente para un servicio de cerrajería en Argentina. Analiza el mensaje del cliente y devuelve un JSON con los campos: flow (una de duplicado, carcasa, llave o vacío), human (true si el cliente quiere hablar con un humano/asesor), role (ASEGURADO o PARTICULAR), aseguradora, marca, modelo, anio, patente, cp. Extrae toda la información posible. Si no se puede determinar un campo, déjalo vacío. El JSON no debe tener propiedades adicionales ni texto extra."
+    },
+    { role: "user", content: text }
+  ];
+  try {
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages,
+      temperature: 0,
+      max_tokens: 200
+    });
+    const responseText = completion.choices?.[0]?.message?.content?.trim();
+    if (!responseText) return null;
+    // Asegurarse de que la respuesta contiene un JSON válido
+    const firstCurly = responseText.indexOf("{");
+    const lastCurly = responseText.lastIndexOf("}");
+    if (firstCurly === -1 || lastCurly === -1) return null;
+    const jsonStr = responseText.slice(firstCurly, lastCurly + 1);
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    console.error("interpretMessage error", e.message || e);
+    return null;
+  }
+}
+
+/**
+ * Fusiona los datos extraídos por la IA con los datos existentes de la sesión. Solo
+ * actualiza los campos si no estaban previamente definidos.
+ */
+function mergeData(target, ai) {
+  if (!ai) return;
+  const keys = ["role","aseguradora","marca","modelo","anio","patente","cp"];
+  for (const k of keys) {
+    if (ai[k] && !target[k]) target[k] = ai[k];
+  }
+}
+
 // ---------- Webhook Twilio ----------
 app.post("/whatsapp", async (req, res) => {
   const from = req.body.From;
@@ -153,21 +216,58 @@ app.post("/whatsapp", async (req, res) => {
   let reply;
 
   let s = S.get(from);
-  if (!s) { s = { stage:"menu", flow:null, data:{}, lastReply:"" }; S.set(from, s); }
+  if (!s) { s = { stage: "menu", flow: null, data: {}, lastReply: "" }; S.set(from, s); }
 
-  // comandos globales
+  // Intentar interpretar el mensaje con IA de forma preventiva.  Si el usuario quiere
+  // hablar con un humano, se maneja inmediatamente.  De lo contrario, se fusionan
+  // los datos extraídos con la sesión.
+  let aiResult = null;
+  if (USE_AI && text) {
+    try {
+      aiResult = await interpretMessage(text);
+    } catch (e) {
+      // ya se logueó en interpretMessage
+    }
+    if (aiResult && aiResult.human) {
+      // El cliente solicita hablar con un asesor
+      reply = "Perfecto, un asesor te contactará por este chat.";
+      try {
+        await client.messages.create({
+          from: TW_FROM,
+          to: toWhats(OWNER),
+          body: `🤝 Pedido de asesor — Cliente: ${from.replace("whatsapp:","")} — Mensaje: ${text}`
+        });
+      } catch (e) { console.error("Aviso asesor IA falló:", e.message); }
+
+      // evitar duplicados y enviar respuesta
+      const safe=(reply||"").trim();
+      if (safe && safe !== s.lastReply?.trim()) {
+        s.lastReply = safe;
+        const twiml = new twilio.twiml.MessagingResponse();
+        twiml.message(safe);
+        return res.type("text/xml").send(twiml.toString());
+      } else {
+        const twiml=new twilio.twiml.MessagingResponse();
+        return res.type("text/xml").send(twiml.toString());
+      }
+    }
+  }
+
+  // Comandos globales
   if (/^(0|menu|menú)$/i.test(text)) {
     reply = menu(s);
   } else if (s.stage === "menu") {
+    // Intención principal (flujo)
+    let flow = null;
     if (/^1$/.test(text) || /duplicad/i.test(text)) {
-      s.flow="duplicado"; s.stage="collect"; reply = pedirTodo(s.flow, s.data);
+      flow = "duplicado";
     } else if (/^2$/.test(text) || /carcasa/i.test(text)) {
-      s.flow="carcasa"; s.stage="collect"; reply = pedirTodo(s.flow, s.data);
+      flow = "carcasa";
     } else if (/^3$/.test(text) || /llave\s*nueva|llave\s*0km|^llave$/i.test(text)) {
-      s.flow="llave"; s.stage="collect"; reply = pedirTodo(s.flow, s.data);
+      flow = "llave";
     } else if (/^4$/.test(text) || /asesor|humano|persona/i.test(text)) {
+      // Handoff manual si no se usa IA
       reply = "Perfecto, un asesor te contactará por este chat.";
-      // aviso interno a vos (cliente no lo ve)
       try {
         await client.messages.create({
           from: TW_FROM,
@@ -175,11 +275,26 @@ app.post("/whatsapp", async (req, res) => {
           body: `🤝 Pedido de asesor — Cliente: ${from.replace("whatsapp:","")} — Mensaje: ${text}`
         });
       } catch (e) { console.error("Aviso asesor falló:", e.message); }
+    }
+    // Si la IA detectó un flow, usarlo si la heurística no encontró uno
+    if (!flow && aiResult && aiResult.flow) {
+      flow = aiResult.flow;
+    }
+    // Fusionar datos extraídos por la IA
+    if (aiResult) mergeData(s.data, aiResult);
+    if (reply) {
+      // ya asignado (asesor manual)
+    } else if (flow) {
+      s.flow = flow;
+      s.stage = "collect";
+      reply = pedirTodo(s.flow, s.data);
     } else {
       reply = menu(s);
     }
   } else if (s.stage === "collect") {
+    // Extraer datos mediante heurística y IA
     absorber(s.data, text);
+    if (aiResult) mergeData(s.data, aiResult);
 
     const faltan = faltantes(s.flow, s.data);
     if (faltan.length) {
@@ -251,7 +366,7 @@ Escribí *menu* para volver al inicio.`;
 });
 
 // ---------- Endpoints de prueba ----------
-app.get("/", (_req,res)=>res.send("Bot KiosKeys (flujo avanzado básico) funcionando 🚀"));
+app.get("/", (_req,res)=>res.send("Bot KiosKeys (flujo con IA) funcionando 🚀"));
 app.get("/test/owner", async (_req,res)=>{
   try{
     await client.messages.create({
